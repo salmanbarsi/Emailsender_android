@@ -1,0 +1,30 @@
+{
+  "name": "firebase-store",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@neondatabase/serverless": "^1.0.1",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.2",
+    "express": "^5.1.0",
+    "firebase": "^12.4.0",
+    "firebase-admin": "^13.5.0",
+    "fs": "^0.0.1-security",
+    "googleapis": "^159.0.0",
+    "imap-simple": "^5.1.0",
+    "multer": "^2.0.2",
+    "nodemailer": "^7.0.6",
+    "nodemon": "^3.1.10",
+    "path": "^0.12.7",
+    "pg": "^8.16.3",
+    "read-excel-file": "^5.8.8"
+  }
+}
