@@ -1,26 +1,27 @@
 // mailserver.js
 const express = require("express");
 const multer = require("multer");
-const nodemailer = require("nodemailer");
+const { google } = require("googleapis");
 const cors = require("cors");
 const readXlsxFile = require("read-excel-file/node");
 const dotenv = require("dotenv");
 const { neon } = require("@neondatabase/serverless");
 const fs = require("fs");
 const path = require("path");
-const { google } = require("googleapis");
+const admin = require("firebase-admin");
+
 dotenv.config();
 
-const admin = require('firebase-admin');
+// ---------------- FIREBASE INIT ----------------
 if (!process.env.FIREBASE_SERVICE_ACCOUNT_BASE64) {
   console.error("❌ Missing FIREBASE_SERVICE_ACCOUNT_BASE64");
   process.exit(1);
 }
 const serviceAccount = JSON.parse(Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT_BASE64, "base64").toString("utf8"));
-admin.initializeApp({credential: admin.credential.cert(serviceAccount)});
+admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 
-
+// ---------------- EXPRESS INIT ----------------
 const app = express();
 const PORT = process.env.PORT || 3001;
 const client = neon(process.env.DATABASE_URL);
@@ -28,12 +29,12 @@ const client = neon(process.env.DATABASE_URL);
 app.use(express.json());
 app.use(cors());
 
-// ------------------ UPLOAD FOLDER ------------------
+// ---------------- UPLOAD FOLDER ----------------
 const upload = multer({ dest: "uploads/" });
 const uploadPath = path.join(__dirname, "uploads");
 if (!fs.existsSync(uploadPath)) fs.mkdirSync(uploadPath);
 
-// ------------------ DATABASE ------------------
+// ---------------- DATABASE TABLES ----------------
 (async () => {
   try {
     await client`
@@ -47,49 +48,13 @@ if (!fs.existsSync(uploadPath)) fs.mkdirSync(uploadPath);
         sent_at TIMESTAMP DEFAULT NOW()
       )
     `;
-    await client`
-      CREATE TABLE IF NOT EXISTS received_emails (
-        id TEXT PRIMARY KEY,
-        from_email TEXT,
-        to_email TEXT,
-        subject TEXT,
-        date TIMESTAMP
-      )
-    `;
-    await client`
-      CREATE TABLE IF NOT EXISTS emails (
-        id TEXT PRIMARY KEY,
-        from_email TEXT,
-        to_email TEXT,
-        subject TEXT,
-        date TIMESTAMP,
-        snippet TEXT
-      )
-    `;
-    await client`
-      CREATE TABLE IF NOT EXISTS emails1 (
-        message_id TEXT PRIMARY KEY,
-        thread_id TEXT,
-        history_id TEXT,
-        from_email TEXT,
-        subject TEXT,
-        received_at TIMESTAMP,
-        snippet TEXT
-      )
-    `;
-    await client`
-      CREATE TABLE IF NOT EXISTS gmail_sync_state (
-        id SERIAL PRIMARY KEY,
-        history_id BIGINT UNIQUE
-      )
-    `;
     console.log("✅ Tables ready");
   } catch (err) {
     console.error("❌ Error creating tables:", err);
   }
 })();
 
-// ------------------ GOOGLE OAUTH2 ------------------
+// ---------------- GOOGLE AUTH ----------------
 function getAuth() {
   const auth = new google.auth.OAuth2(
     process.env.GOOGLE_CLIENT_ID,
@@ -102,96 +67,108 @@ function getAuth() {
   return auth;
 }
 
-// ------------------ SMTP TRANSPORTER ------------------
-function createTransporterSMTP() {
-  return nodemailer.createTransport({
-    service: "gmail",
-    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+// ---------------- GMAIL SEND FUNCTION ----------------
+async function sendMail({ to, subject, text, attachments = [] }) {
+  const auth = getAuth();
+  const gmail = google.gmail({ version: "v1", auth });
+
+  const messageParts = [
+    `From: ${process.env.SMTP_USER}`,
+    `To: ${to}`,
+    `Subject: ${subject}`,
+    "Content-Type: multipart/mixed; boundary=boundary_string",
+    "",
+    "--boundary_string",
+    "Content-Type: text/plain; charset=UTF-8",
+    "",
+    text,
+  ];
+
+  // Add attachments
+  for (const file of attachments) {
+    const fileContent = fs.readFileSync(file.path).toString("base64");
+    messageParts.push(
+      "--boundary_string",
+      `Content-Type: application/octet-stream; name="${file.filename}"`,
+      "Content-Transfer-Encoding: base64",
+      `Content-Disposition: attachment; filename="${file.filename}"`,
+      "",
+      fileContent
+    );
+  }
+
+  messageParts.push("--boundary_string--");
+
+  const raw = Buffer.from(messageParts.join("\n")).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+
+  await gmail.users.messages.send({
+    userId: "me",
+    requestBody: { raw },
   });
 }
 
-// ------------------ SEND SINGLE EMAIL ------------------
+// ---------------- SINGLE EMAIL ----------------
 app.post("/api/send-emails", upload.single("attachment"), async (req, res) => {
   try {
     const { name, email, subject, message } = req.body;
     const file = req.file;
-    const transporter = createTransporterSMTP();
     const attachments = file ? [{ filename: file.originalname, path: file.path }] : [];
 
-    await transporter.sendMail({
-      from: process.env.SMTP_USER,
-      to: email,
-      subject,
-      text: message,
-      attachments,
-    });
+    await sendMail({ to: email, subject, text: message, attachments });
 
+    // Save to NeonDB
     await client`
       INSERT INTO sent_emails (name, email, subject, message, filename)
       VALUES (${name}, ${email}, ${subject}, ${message}, ${file ? file.originalname : null})
-      RETURNING *
     `;
 
+    // Save to Firebase
     const savedId = Math.floor(1000000000 + Math.random() * 9000000000).toString();
-    const savedEmail = { id: savedId, From:process.env.SMTP_USER,to:email, subject, message, sent_at: new Date().toISOString(),};
+    const savedEmail = { id: savedId, from: process.env.SMTP_USER, to: email, subject, message, sent_at: new Date().toISOString() };
     await db.collection("sent_emails").doc(savedId.toString()).set(savedEmail);
 
-    res.status(200).json({ message: "✅ Email sent successfully!", email: savedEmail });
+    res.json({ message: "✅ Email sent successfully!", email: savedEmail });
   } catch (err) {
     console.error("❌ Error sending email:", err);
     res.status(500).json({ message: "Failed to send email" });
   }
 });
 
-// ------------------ BULK EMAIL IMPORT ------------------
+// ---------------- BULK EMAIL ----------------
 app.post("/api/import-emails", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ message: "No file uploaded" });
 
     const { subject: commonSubject, message: commonMessage } = req.body;
-    if (!commonSubject || !commonMessage)
-      return res.status(400).json({ message: "Subject and message are required" });
+    if (!commonSubject || !commonMessage) return res.status(400).json({ message: "Subject and message are required" });
 
     const rows = await readXlsxFile(req.file.path);
-    const headerRow = rows[0].map((c) => c.toString().toLowerCase());
+    const headerRow = rows[0].map(c => c.toString().toLowerCase());
     const dataRows = headerRow.includes("email") ? rows.slice(1) : rows;
 
-    const transporter = createTransporterSMTP();
     const failedEmails = [];
 
     for (const row of dataRows) {
-      let name = null;
-      let email = null;
-      let subject = commonSubject;
-      let message = commonMessage;
+      let name = null, email = null, subject = commonSubject, message = commonMessage;
 
       if (row.length === 1) email = row[0];
-      else if (row.length === 2) {
-        name = row[0];
-        email = row[1];
-      } else if (row.length >= 4) {
-        name = row[0];
-        email = row[1];
-        subject = row[2] || commonSubject;
-        message = row[3] || commonMessage;
-      }
+      else if (row.length === 2) { name = row[0]; email = row[1]; }
+      else if (row.length >= 4) { name = row[0]; email = row[1]; subject = row[2] || commonSubject; message = row[3] || commonMessage; }
 
       if (!email) continue;
 
       try {
-        // Send email
-        await transporter.sendMail({ from: process.env.SMTP_USER, to: email, subject, text: message });
+        await sendMail({ to: email, subject, text: message });
 
-        // Store in Neon (serverless client)
-        const neonResult = await client`
+        // Save to NeonDB
+        await client`
           INSERT INTO sent_emails (name, email, subject, message, filename)
           VALUES (${name}, ${email}, ${subject}, ${message}, ${req.file.originalname})
-          RETURNING id
         `;
 
-        // Store in Firebase
+        // Save to Firebase
         const savedId = Math.floor(1000000000 + Math.random() * 9000000000).toString();
-        const savedEmail = { id: savedId, From:process.env.SMTP_USER,to:email, subject, message, sent_at: new Date().toISOString(),};
+        const savedEmail = { id: savedId, from: process.env.SMTP_USER, to: email, subject, message, sent_at: new Date().toISOString() };
         await db.collection("sent_emails").doc(savedId.toString()).set(savedEmail);
 
       } catch (err) {
@@ -205,7 +182,7 @@ app.post("/api/import-emails", upload.single("file"), async (req, res) => {
     console.error("❌ Bulk import error:", err);
     res.status(500).json({ message: "Failed to send bulk emails" });
   }
-});
+})
 
 
 // --------------- FETCH LAST 30 DAYS EMAILS ---------------
